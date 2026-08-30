@@ -46,6 +46,25 @@ Sizes are **weights, never pixels**. `Layout::geometry` recomputes rects from we
 
 Every adoption is additionally recorded in the `ADOPTED` static so the panic hook can hand windows back before the process dies. `App` and that registry must stay in sync: go through `window_manager::{embed, release}`, never call `SetParent` directly.
 
+### Focus
+
+Click-to-focus is the tray's job, not the adopted app's, and this is not obvious enough to rediscover by reading the handlers.
+
+A window that used to be top-level received keyboard focus through *activation*; it never had to call `SetFocus` on itself when clicked, because the system did it. Reparented, it gets neither — and the click goes straight to the child, so our `wndproc` never sees it. Left alone, the tray looks focused but nothing accepts typing.
+
+Four handlers cover it, and removing any one leaves a dead path:
+
+| Message | Case it covers |
+|---|---|
+| `WM_PARENTNOTIFY` | Click inside an adopted window while the tray is already active. The only signal we get for those clicks. |
+| `WM_MOUSEACTIVATE` | Click that *activates* the tray. Records the pane; focus is applied by the `WM_ACTIVATE` that follows, because focus set before activation completes does not stick. |
+| `WM_ACTIVATE` | Alt-Tab back to the tray. |
+| `WM_SETFOCUS` | The tray has no keyboard UI, so it forwards focus to the active pane instead of keeping it — this is what stops clicks on our own chrome from stranding the keyboard. |
+
+`App::adopt_focus` covers the remaining case: the focused pane being released or dying.
+
+None of this works without the `AttachThreadInput` in `embed` — `SetFocus` on a window owned by another thread is a silent no-op otherwise.
+
 ## Gotchas
 
 - **`match` on raw `u32` message constants is a trap.** An unimported constant is a valid catch-all binding, not a compile error, so it silently swallows every arm below it. This already happened once: `WM_MOUSELEAVE` lives in `Win32::UI::Controls`, not `WindowsAndMessaging`, and its bare name in `wndproc` killed ten handlers with only a `unreachable pattern` warning. Check warnings on any new message arm.

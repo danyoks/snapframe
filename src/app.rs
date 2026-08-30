@@ -11,7 +11,7 @@ use crate::window_manager as wm;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, InvalidateRect, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
-    RedrawWindow,
+    RedrawWindow, ScreenToClient,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -246,6 +246,19 @@ impl App {
         }
         self.hot = Hit::None;
         self.relayout();
+        self.adopt_focus();
+    }
+
+    /// Hand the keyboard to some surviving pane after the focused one goes away, the
+    /// way closing a tab moves you to a neighbour rather than to nothing.
+    fn adopt_focus(&mut self) {
+        if self.active.is_some_and(wm::is_valid) {
+            return;
+        }
+        self.active = self.layout.panes().next().map(|p| p.hwnd);
+        if let Some(hwnd) = self.active {
+            wm::focus_child(hwnd);
+        }
     }
 
     /// Hand every adopted window back to the desktop. Also the shutdown path, so it
@@ -295,6 +308,7 @@ impl App {
 
         if dirty {
             self.relayout();
+            self.adopt_focus();
         }
     }
 
@@ -522,15 +536,85 @@ impl App {
 
     fn focus_pane(&mut self, col: usize, slot: usize) {
         if let Some(pane) = self.layout.pane_at(col, slot) {
+            let changed = self.active != Some(pane.hwnd);
             self.active = Some(pane.hwnd);
             wm::focus_child(pane.hwnd);
-            self.invalidate();
+            if changed {
+                self.invalidate();
+            }
+        }
+    }
+
+    fn cursor_client(&self) -> Option<POINT> {
+        unsafe {
+            let mut pt = POINT::default();
+            GetCursorPos(&mut pt).ok()?;
+            if !ScreenToClient(self.hwnd, &mut pt).as_bool() {
+                return None;
+            }
+            Some(pt)
+        }
+    }
+
+    /// Focus whichever pane the pointer is over. The point is resolved through the
+    /// cached geometry rather than the clicked HWND, so a click on a deeply nested
+    /// control inside an adopted app still resolves to its pane.
+    fn focus_pane_at_cursor(&mut self) {
+        let Some(pt) = self.cursor_client() else {
+            return;
+        };
+        if let Hit::Header(c, s) | Hit::Close(c, s) | Hit::Client(c, s) = self.geom.hit_test(pt) {
+            self.focus_pane(c, s);
+        }
+    }
+
+    /// A click landed inside an adopted window.
+    ///
+    /// This is the whole reason click-to-focus works. The click itself goes straight
+    /// to the child and never reaches our `wndproc`; a window that used to be
+    /// top-level got its keyboard focus from activation and so never learned to call
+    /// `SetFocus` on itself. As its container, we have to do it for it.
+    pub fn on_parent_notify(&mut self, event: u32) {
+        if matches!(
+            event,
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+        ) {
+            self.focus_pane_at_cursor();
+        }
+    }
+
+    /// A click is about to activate the tray. Record which pane it landed on; the
+    /// `WM_ACTIVATE` that follows is what actually moves the focus, because focus set
+    /// before activation completes does not stick.
+    pub fn on_mouse_activate(&mut self) {
+        let Some(pt) = self.cursor_client() else {
+            return;
+        };
+        if let Hit::Header(c, s) | Hit::Close(c, s) | Hit::Client(c, s) = self.geom.hit_test(pt)
+            && let Some(pane) = self.layout.pane_at(c, s)
+        {
+            self.active = Some(pane.hwnd);
         }
     }
 
     /// Give the keyboard back to the active pane when the tray regains activation.
     pub fn on_activate(&mut self, active: bool) {
-        if active && let Some(hwnd) = self.active {
+        if !active {
+            return;
+        }
+        if self.active.is_none() {
+            self.active = self.layout.panes().next().map(|p| p.hwnd);
+        }
+        if let Some(hwnd) = self.active {
+            wm::focus_child(hwnd);
+        }
+    }
+
+    /// The tray itself has no keyboard UI, so it never keeps focus: hand it straight
+    /// on to the active pane. Without this, clicking our own chrome (a header, a
+    /// splitter, the empty background) would leave the keyboard pointing at nothing.
+    pub fn on_set_focus(&mut self) {
+        if let Some(hwnd) = self.active {
             wm::focus_child(hwnd);
         }
     }

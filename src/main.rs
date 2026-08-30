@@ -148,6 +148,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 app.on_activate(loword(wparam) != WA_INACTIVE);
                 LRESULT(0)
             }
+            // Clicks inside an adopted window never reach this wndproc; WM_PARENTNOTIFY
+            // is how the container learns about them and can move focus.
+            WM_PARENTNOTIFY => {
+                app.on_parent_notify(loword(wparam));
+                LRESULT(0)
+            }
+            WM_MOUSEACTIVATE => {
+                app.on_mouse_activate();
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_SETFOCUS => {
+                app.on_set_focus();
+                LRESULT(0)
+            }
             WM_GETMINMAXINFO => {
                 app.on_min_max(&mut *(lparam.0 as *mut MINMAXINFO));
                 LRESULT(0)
