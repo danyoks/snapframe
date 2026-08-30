@@ -7,8 +7,7 @@ use crate::layout::{Geom, Hit, Layout, Metrics};
 use crate::window_manager::to_utf16;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
@@ -25,12 +24,16 @@ const CLR_CLOSE_HOT: COLORREF = COLORREF(0x002020C0);
 const CLR_TEXT: COLORREF = COLORREF(0x00E8E8E8);
 const CLR_TEXT_DIM: COLORREF = COLORREF(0x00909090);
 
-/// Sink the system title bar into the toolbar colour so the tray reads as one quiet
-/// strip instead of a bright accent-coloured band above a dark one.
+/// Tone down the parts of the frame we do *not* draw.
 ///
-/// Windows 11 build 22000+ only; on anything older every call fails harmlessly and
-/// the caption stays the system default.
-pub fn quiet_title_bar(hwnd: HWND) {
+/// The caption itself is gone — `WM_NCCALCSIZE` hands that strip to us — so all that
+/// is left to the system is the one-pixel border and the shadow behind it. Painting
+/// the border in the tray's own background stops a bright outline from boxing in an
+/// otherwise dark window.
+///
+/// Windows 11 build 22000+ only; older systems fail both calls harmlessly and get the
+/// default border.
+pub fn quiet_frame(hwnd: HWND) {
     unsafe {
         let dark: i32 = 1;
         let _ = DwmSetWindowAttribute(
@@ -39,20 +42,13 @@ pub fn quiet_title_bar(hwnd: HWND) {
             (&raw const dark).cast(),
             size_of::<i32>() as u32,
         );
-        // The caption matches the toolbar exactly; the border matches the tray
-        // background so the outline does not draw a bright box around everything.
-        for (attr, color) in [
-            (DWMWA_CAPTION_COLOR, CLR_TOOLBAR),
-            (DWMWA_BORDER_COLOR, CLR_BG),
-            (DWMWA_TEXT_COLOR, CLR_TEXT_DIM),
-        ] {
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                attr,
-                (&raw const color).cast(),
-                size_of::<COLORREF>() as u32,
-            );
-        }
+        let border = CLR_BG;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&raw const border).cast(),
+            size_of::<COLORREF>() as u32,
+        );
     }
 }
 
@@ -69,6 +65,20 @@ pub struct Button {
     pub rect: RECT,
     pub label: &'static str,
     pub cmd: Command,
+}
+
+/// The window controls we now draw ourselves, since there is no system caption left
+/// to draw them for us.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CaptionButton {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+pub struct CaptionSlot {
+    pub rect: RECT,
+    pub kind: CaptionButton,
 }
 
 pub struct Theme {
@@ -219,6 +229,10 @@ pub struct PaintCtx<'a> {
     pub pressed_button: Option<Command>,
     pub active: Option<(usize, usize)>,
     pub drop_target: Option<(usize, usize)>,
+    pub caption: &'a [CaptionSlot],
+    pub hot_caption: Option<CaptionButton>,
+    pub pressed_caption: Option<CaptionButton>,
+    pub maximized: bool,
 }
 
 pub fn paint(hwnd: HWND, buf: &mut BackBuffer, ctx: &PaintCtx) {
@@ -261,6 +275,8 @@ unsafe fn draw_all(dc: HDC, client: RECT, ctx: &PaintCtx) {
             }
             draw_label(dc, b.rect, b.label, CLR_TEXT, DT_CENTER);
         }
+
+        draw_caption_buttons(dc, ctx);
 
         if ctx.layout.is_empty() {
             let hint = RECT {
@@ -348,6 +364,66 @@ unsafe fn draw_label(
             &mut r,
             DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | format,
         );
+    }
+}
+
+unsafe fn draw_caption_buttons(dc: HDC, ctx: &PaintCtx) {
+    let t = ctx.theme;
+    unsafe {
+        for slot in ctx.caption {
+            let hot = ctx.hot_caption == Some(slot.kind);
+            let pressed = ctx.pressed_caption == Some(slot.kind);
+            if hot || pressed {
+                // Close goes red on hover, the way every Windows title bar does; the
+                // other two just lighten.
+                let brush = match (slot.kind, pressed) {
+                    (CaptionButton::Close, _) => t.close_hot,
+                    (_, true) => t.header_active,
+                    _ => t.btn_hot,
+                };
+                FillRect(dc, &slot.rect, brush);
+            }
+
+            let r = slot.rect;
+            let cx = (r.left + r.right) / 2;
+            let cy = (r.top + r.bottom) / 2;
+            // Glyphs are stroked rather than typed so they stay crisp at any DPI and
+            // do not depend on the UI font carrying the box-drawing symbols.
+            let half = ((r.bottom - r.top) / 6).max(4);
+            let prev = SelectObject(dc, t.close_pen.into());
+            match slot.kind {
+                CaptionButton::Minimize => {
+                    let _ = MoveToEx(dc, cx - half, cy, None);
+                    let _ = LineTo(dc, cx + half, cy);
+                }
+                CaptionButton::Maximize if ctx.maximized => {
+                    let off = (half / 3).max(2);
+                    frame_lines(dc, cx - half, cy - half + off, cx + half - off, cy + half);
+                    frame_lines(dc, cx - half + off, cy - half, cx + half, cy + half - off);
+                }
+                CaptionButton::Maximize => {
+                    frame_lines(dc, cx - half, cy - half, cx + half, cy + half);
+                }
+                CaptionButton::Close => {
+                    let _ = MoveToEx(dc, cx - half, cy - half, None);
+                    let _ = LineTo(dc, cx + half, cy + half);
+                    let _ = MoveToEx(dc, cx + half - 1, cy - half, None);
+                    let _ = LineTo(dc, cx - half - 1, cy + half);
+                }
+            }
+            SelectObject(dc, prev);
+        }
+    }
+}
+
+/// Stroke a hollow rectangle with the pen already selected into `dc`.
+unsafe fn frame_lines(dc: HDC, left: i32, top: i32, right: i32, bottom: i32) {
+    unsafe {
+        let _ = MoveToEx(dc, left, top, None);
+        let _ = LineTo(dc, right, top);
+        let _ = LineTo(dc, right, bottom);
+        let _ = LineTo(dc, left, bottom);
+        let _ = LineTo(dc, left, top);
     }
 }
 

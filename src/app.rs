@@ -4,18 +4,18 @@
 //! Owned by the main window through `GWLP_USERDATA`; `main::wndproc` does nothing but
 //! decode messages and call in here.
 
-use crate::chrome::{BackBuffer, Button, Command, PaintCtx, Theme};
+use crate::chrome::{BackBuffer, Button, CaptionButton, CaptionSlot, Command, PaintCtx, Theme};
 use crate::layout::{Geom, Hit, Layout, Metrics, Pane};
 use crate::window_manager as wm;
 
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, InvalidateRect, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE, RDW_UPDATENOW,
     RedrawWindow, ScreenToClient,
 };
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
@@ -55,6 +55,12 @@ pub struct App {
     layout: Layout,
     geom: Geom,
     buttons: Vec<Button>,
+    caption: Vec<CaptionSlot>,
+    hot_caption: Option<CaptionButton>,
+    pressed_caption: Option<CaptionButton>,
+    /// Thickness of the top resize grip. The system frame no longer covers the top
+    /// edge — it is our client area now — so we synthesise `HTTOP` over this band.
+    resize_handle: i32,
     hot: Hit,
     hot_button: Option<Command>,
     /// Toolbar button currently held down. Commands fire on release, not press:
@@ -65,6 +71,15 @@ pub struct App {
     active: Option<HWND>,
     drag: Option<Drag>,
     tracking_leave: bool,
+    tracking_nc_leave: bool,
+}
+
+/// Thickness of the window's resize border at `dpi`, which is also how tall a top
+/// grip has to be to feel the same as the system's.
+fn resize_handle_for(dpi: u32) -> i32 {
+    unsafe {
+        GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    }
 }
 
 impl App {
@@ -81,12 +96,17 @@ impl App {
             layout: Layout::default(),
             geom: Geom::default(),
             buttons: Vec::new(),
+            caption: Vec::new(),
+            hot_caption: None,
+            pressed_caption: None,
+            resize_handle: resize_handle_for(dpi),
             hot: Hit::None,
             hot_button: None,
             pressed_button: None,
             active: None,
             drag: None,
             tracking_leave: false,
+            tracking_nc_leave: false,
         };
         app.build_buttons();
         app.relayout();
@@ -128,8 +148,44 @@ impl App {
         }
     }
 
+    /// Caption buttons hug the right edge, so unlike the toolbar commands they have
+    /// to be re-laid-out whenever the window's width changes.
+    fn build_caption_buttons(&mut self) {
+        self.caption.clear();
+        let right = self.client().right;
+        let mut x = right;
+        for kind in [
+            CaptionButton::Close,
+            CaptionButton::Maximize,
+            CaptionButton::Minimize,
+        ] {
+            x -= self.m.caption_w;
+            self.caption.push(CaptionSlot {
+                rect: RECT {
+                    left: x,
+                    top: 0,
+                    right: x + self.m.caption_w,
+                    bottom: self.m.toolbar,
+                },
+                kind,
+            });
+        }
+    }
+
+    fn caption_button_at(&self, pt: POINT) -> Option<CaptionButton> {
+        self.caption
+            .iter()
+            .find(|s| crate::layout::contains(&s.rect, pt))
+            .map(|s| s.kind)
+    }
+
+    fn is_maximized(&self) -> bool {
+        unsafe { IsZoomed(self.hwnd).as_bool() }
+    }
+
     /// Recompute pixel geometry and push the adopted windows to their new rects.
     pub fn relayout(&mut self) {
+        self.build_caption_buttons();
         self.geom = self.layout.geometry(self.content(), &self.m);
         self.place_children();
         self.invalidate();
@@ -390,6 +446,9 @@ impl App {
     }
 
     pub fn on_mouse_move(&mut self, pt: POINT) {
+        // Moving into the client area means we left the caption buttons; no
+        // WM_NCMOUSELEAVE arrives for that transition.
+        self.clear_caption_hover();
         if !self.tracking_leave {
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
@@ -545,15 +604,20 @@ impl App {
         }
     }
 
-    fn cursor_client(&self) -> Option<POINT> {
+    fn to_client(&self, screen: POINT) -> Option<POINT> {
+        let mut pt = screen;
         unsafe {
-            let mut pt = POINT::default();
-            GetCursorPos(&mut pt).ok()?;
             if !ScreenToClient(self.hwnd, &mut pt).as_bool() {
                 return None;
             }
-            Some(pt)
         }
+        Some(pt)
+    }
+
+    fn cursor_client(&self) -> Option<POINT> {
+        let mut pt = POINT::default();
+        unsafe { GetCursorPos(&mut pt).ok()? };
+        self.to_client(pt)
     }
 
     /// Focus whichever pane the pointer is over. The point is resolved through the
@@ -635,6 +699,120 @@ impl App {
         false
     }
 
+    // ---- custom frame ----------------------------------------------------
+
+    /// Classify a point now that the caption strip is part of our client area.
+    ///
+    /// `def` is what `DefWindowProcW` said. It still gets the left, right and bottom
+    /// borders right, because those are the only non-client edges left; everything
+    /// along the top — the resize grip, the drag region, the window controls — has to
+    /// be reconstructed here.
+    pub fn on_nc_hit_test(&self, screen: POINT, def: LRESULT) -> LRESULT {
+        let Some(pt) = self.to_client(screen) else {
+            return def;
+        };
+        let ht = def.0 as u32;
+        // A maximized window cannot be resized, so no grip along its top edge.
+        let in_grip = !self.is_maximized() && pt.y >= 0 && pt.y < self.resize_handle;
+
+        let code = match ht {
+            HTCLIENT if in_grip => HTTOP,
+            HTLEFT if in_grip => HTTOPLEFT,
+            HTRIGHT if in_grip => HTTOPRIGHT,
+            HTCLIENT => match self.caption_button_at(pt) {
+                Some(CaptionButton::Minimize) => HTMINBUTTON,
+                // Windows 11 shows its Snap Layouts flyout when the pointer rests on
+                // something reported as HTMAXBUTTON — worth having in a tray app.
+                Some(CaptionButton::Maximize) => HTMAXBUTTON,
+                Some(CaptionButton::Close) => HTCLOSE,
+                None if pt.y < self.m.toolbar && self.hit(pt).1.is_none() => HTCAPTION,
+                None => return def,
+            },
+            _ => return def,
+        };
+        LRESULT(code as isize)
+    }
+
+    pub fn on_nc_mouse_move(&mut self, screen: POINT) {
+        if !self.tracking_nc_leave {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE | TME_NONCLIENT,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            unsafe {
+                let _ = TrackMouseEvent(&mut tme);
+            }
+            self.tracking_nc_leave = true;
+        }
+        let hot = self.to_client(screen).and_then(|pt| self.caption_button_at(pt));
+        if hot != self.hot_caption {
+            self.hot_caption = hot;
+            self.invalidate();
+        }
+    }
+
+    pub fn on_nc_mouse_leave(&mut self) {
+        self.tracking_nc_leave = false;
+        self.clear_caption_hover();
+    }
+
+    fn clear_caption_hover(&mut self) {
+        if self.hot_caption.is_some() {
+            self.hot_caption = None;
+            self.invalidate();
+        }
+    }
+
+    /// Returns true when we consumed the click and `DefWindowProcW` must not run.
+    pub fn on_nc_lbutton_down(&mut self, ht: u32) -> bool {
+        let kind = match ht {
+            HTMINBUTTON => CaptionButton::Minimize,
+            HTMAXBUTTON => CaptionButton::Maximize,
+            HTCLOSE => CaptionButton::Close,
+            _ => return false,
+        };
+        self.pressed_caption = Some(kind);
+        self.invalidate();
+        true
+    }
+
+    pub fn on_nc_lbutton_up(&mut self, ht: u32) -> bool {
+        let Some(pressed) = self.pressed_caption.take() else {
+            return false;
+        };
+        self.invalidate();
+        let released_on = match ht {
+            HTMINBUTTON => Some(CaptionButton::Minimize),
+            HTMAXBUTTON => Some(CaptionButton::Maximize),
+            HTCLOSE => Some(CaptionButton::Close),
+            _ => None,
+        };
+        if released_on != Some(pressed) {
+            return true;
+        }
+        unsafe {
+            match pressed {
+                CaptionButton::Minimize => {
+                    let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
+                }
+                CaptionButton::Maximize => {
+                    let cmd = if self.is_maximized() {
+                        SW_RESTORE
+                    } else {
+                        SW_MAXIMIZE
+                    };
+                    let _ = ShowWindow(self.hwnd, cmd);
+                }
+                CaptionButton::Close => {
+                    let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+        true
+    }
+
     // ---- window plumbing -------------------------------------------------
 
     pub fn on_size(&mut self) {
@@ -649,6 +827,7 @@ impl App {
     pub fn on_dpi_changed(&mut self, dpi: u32, suggested: &RECT) {
         self.dpi = dpi.max(96);
         self.m = Metrics::for_dpi(self.dpi);
+        self.resize_handle = resize_handle_for(self.dpi);
         self.theme.destroy();
         self.theme = Theme::new(&self.m);
         self.buf.destroy();
@@ -686,6 +865,10 @@ impl App {
             pressed_button: self.pressed_button,
             active,
             drop_target,
+            caption: &self.caption,
+            hot_caption: self.hot_caption,
+            pressed_caption: self.pressed_caption,
+            maximized: self.is_maximized(),
         };
         crate::chrome::paint(self.hwnd, &mut self.buf, &ctx);
     }

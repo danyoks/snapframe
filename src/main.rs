@@ -17,8 +17,8 @@ use window_manager::to_utf16;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_HOSTING_BEHAVIOR_MIXED,
-    SetProcessDpiAwarenessContext, SetThreadDpiHostingBehavior,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, DPI_HOSTING_BEHAVIOR_MIXED, GetDpiForWindow,
+    GetSystemMetricsForDpi, SetProcessDpiAwarenessContext, SetThreadDpiHostingBehavior,
 };
 // WM_MOUSELEAVE lives in Controls, not WindowsAndMessaging. Without this import the
 // bare name in `wndproc`'s match becomes a catch-all binding and silently swallows
@@ -75,7 +75,17 @@ fn main() -> Result<()> {
             None,
         )?;
 
-        chrome::quiet_title_bar(hwnd);
+        chrome::quiet_frame(hwnd);
+        // Force a WM_NCCALCSIZE pass so the frame is recomputed without the caption.
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
         let _ = ShowWindow(hwnd, SW_SHOW);
 
         let mut message = MSG::default();
@@ -88,8 +98,42 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Thickness of the window's resize border, which is also how far a maximized window
+/// overhangs the monitor on each side.
+fn resize_handle(hwnd: HWND) -> i32 {
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+    }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        // Reclaim the caption strip as client area. This is what removes the title
+        // bar, and it is deliberately done by keeping the real frame rather than
+        // dropping to WS_POPUP: Snap, the resize borders, the drop shadow and the
+        // rounded corners all keep working because the frame is still there — we
+        // just draw over where the caption used to be.
+        //
+        // Handled before the App lookup because it arrives during CreateWindowExW,
+        // and letting even one of them fall through leaves a title bar flash.
+        if msg == WM_NCCALCSIZE && wparam.0 != 0 {
+            let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
+            let original_top = params.rgrc[0].top;
+            let ret = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if ret.0 != 0 {
+                return ret;
+            }
+            params.rgrc[0].top = original_top;
+            if IsZoomed(hwnd).as_bool() {
+                // A maximized window is positioned so its frame hangs off every edge
+                // of the monitor. Without pulling the top back in by that much, the
+                // toolbar would sit off-screen.
+                params.rgrc[0].top += resize_handle(hwnd);
+            }
+            return LRESULT(0);
+        }
+
         if msg == WM_CREATE {
             let app = Box::new(App::new(hwnd));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
@@ -163,6 +207,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 app.on_set_focus();
                 LRESULT(0)
             }
+            WM_NCHITTEST => {
+                let def = DefWindowProcW(hwnd, msg, wparam, lparam);
+                app.on_nc_hit_test(point_of(lparam), def)
+            }
+            WM_NCMOUSEMOVE => {
+                app.on_nc_mouse_move(point_of(lparam));
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_NCMOUSELEAVE => {
+                app.on_nc_mouse_leave();
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_NCLBUTTONDOWN if app.on_nc_lbutton_down(wparam.0 as u32) => LRESULT(0),
+            WM_NCLBUTTONUP if app.on_nc_lbutton_up(wparam.0 as u32) => LRESULT(0),
             WM_GETMINMAXINFO => {
                 app.on_min_max(&mut *(lparam.0 as *mut MINMAXINFO));
                 LRESULT(0)

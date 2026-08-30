@@ -15,6 +15,8 @@ const MIN_SLOT_DIP: i32 = 90;
 
 #[derive(Clone, Copy)]
 pub struct Metrics {
+    /// Height of the top strip. It doubles as the window's caption now that the
+    /// system title bar is gone, so it also sizes the min/max/close buttons.
     pub toolbar: i32,
     pub header: i32,
     pub split: i32,
@@ -22,19 +24,22 @@ pub struct Metrics {
     pub close: i32,
     pub min_slot: i32,
     pub font_px: i32,
+    /// Width of one caption button, matching the Windows 11 proportions.
+    pub caption_w: i32,
 }
 
 impl Metrics {
     pub fn for_dpi(dpi: u32) -> Self {
         let s = |dip: i32| (dip * dpi as i32 + 48) / 96;
         Self {
-            toolbar: s(34),
+            toolbar: s(36),
             header: s(24),
             split: s(6),
             pad: s(6),
             close: s(18),
             min_slot: s(MIN_SLOT_DIP),
             font_px: s(14),
+            caption_w: s(46),
         }
     }
 }

@@ -46,6 +46,24 @@ Sizes are **weights, never pixels**. `Layout::geometry` recomputes rects from we
 
 Every adoption is additionally recorded in the `ADOPTED` static so the panic hook can hand windows back before the process dies. `App` and that registry must stay in sync: go through `window_manager::{embed, release}`, never call `SetParent` directly.
 
+### The custom frame
+
+There is no system title bar. `WM_NCCALCSIZE` hands the caption strip to the client area, and the toolbar is drawn where the caption used to be.
+
+The important choice: the window keeps `WS_OVERLAPPEDWINDOW` and a real frame. Dropping to `WS_POPUP` would have been simpler and would have cost Snap, the resize borders, the drop shadow and the rounded corners — all of which matter a lot for a tray whose entire purpose is Snap. So the frame is still there; we only paint over it.
+
+What that costs, and where each piece lives:
+
+- **`WM_NCCALCSIZE`** (`main::wndproc`, handled *before* the `App` lookup because it arrives during `CreateWindowExW`) calls `DefWindowProcW`, then restores the original `top`. Letting even one of these fall through gives a title-bar flash on startup.
+- **Maximized windows overhang the monitor** by the frame thickness on every side. `WM_NCCALCSIZE` adds `resize_handle()` back to `top` when `IsZoomed`, or the toolbar sits off-screen.
+- **`WM_NCHITTEST`** (`App::on_nc_hit_test`) reconstructs everything along the top: `DefWindowProcW` still gets the left/right/bottom borders right, but the top edge is client area now, so the resize grip (`HTTOP`/`HTTOPLEFT`/`HTTOPRIGHT`), the drag region (`HTCAPTION`) and the window controls are all synthesised. No grip when maximized — that window cannot be resized.
+- **The window controls are ours to run.** Reporting `HTMINBUTTON`/`HTMAXBUTTON`/`HTCLOSE` gets hover and the Windows 11 Snap Layouts flyout for free, but no click handling, so `App::on_nc_lbutton_{down,up}` implements press-and-release itself.
+- Hover on those buttons arrives as `WM_NCMOUSEMOVE`, which needs its own `TrackMouseEvent` with `TME_NONCLIENT`. Moving from a button into the client area produces no `WM_NCMOUSELEAVE`, so `on_mouse_move` clears the hover too.
+
+Double-click-to-maximize, the Alt+Space system menu and right-click-on-caption all still come from `DefWindowProcW`, because the drag region is reported as a genuine `HTCAPTION`.
+
+Caption *colour* is no longer a thing worth setting — there is no caption. `chrome::quiet_frame` only darkens the one-pixel border that is left.
+
 ### Focus
 
 Click-to-focus is the tray's job, not the adopted app's, and this is not obvious enough to rediscover by reading the handlers.
@@ -84,3 +102,5 @@ Driving the GUI from PowerShell works, with two quirks worth knowing before conc
 
 - `FindWindow`/`FindWindowEx` return 0 in this environment. Locate windows with `EnumWindows` instead.
 - The **first** synthetic click after a script starts is consumed by window activation. Send a harmless warm-up click before the one you are actually testing.
+- Drive clicks in **client** coordinates (`ClientToScreen` on the tray), not window coordinates. With the caption reclaimed, the client origin is flush with the window's top edge, so the two differ by the frame inset only on the sides.
+- Caption-button positions are right-aligned, so they move with the window width — recompute them after a maximize instead of reusing coordinates from before it.
