@@ -75,6 +75,7 @@ fn main() -> Result<()> {
             None,
         )?;
 
+        chrome::quiet_title_bar(hwnd);
         let _ = ShowWindow(hwnd, SW_SHOW);
 
         let mut message = MSG::default();

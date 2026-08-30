@@ -6,6 +6,10 @@
 use crate::layout::{Geom, Hit, Layout, Metrics};
 use crate::window_manager::to_utf16;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT, SIZE};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -20,6 +24,37 @@ const CLR_BTN_HOT: COLORREF = COLORREF(0x00504F4E);
 const CLR_CLOSE_HOT: COLORREF = COLORREF(0x002020C0);
 const CLR_TEXT: COLORREF = COLORREF(0x00E8E8E8);
 const CLR_TEXT_DIM: COLORREF = COLORREF(0x00909090);
+
+/// Sink the system title bar into the toolbar colour so the tray reads as one quiet
+/// strip instead of a bright accent-coloured band above a dark one.
+///
+/// Windows 11 build 22000+ only; on anything older every call fails harmlessly and
+/// the caption stays the system default.
+pub fn quiet_title_bar(hwnd: HWND) {
+    unsafe {
+        let dark: i32 = 1;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&raw const dark).cast(),
+            size_of::<i32>() as u32,
+        );
+        // The caption matches the toolbar exactly; the border matches the tray
+        // background so the outline does not draw a bright box around everything.
+        for (attr, color) in [
+            (DWMWA_CAPTION_COLOR, CLR_TOOLBAR),
+            (DWMWA_BORDER_COLOR, CLR_BG),
+            (DWMWA_TEXT_COLOR, CLR_TEXT_DIM),
+        ] {
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                attr,
+                (&raw const color).cast(),
+                size_of::<COLORREF>() as u32,
+            );
+        }
+    }
+}
 
 /// Toolbar commands. Values double as popup-menu ids, so they must stay non-zero
 /// and must not collide with the window ids handed out in the add menu.
