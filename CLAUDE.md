@@ -14,7 +14,7 @@ cargo clippy --all-targets
 
 Windows-only (Win32, `x86_64-pc-windows-msvc`). A plain PowerShell works — rustc locates the MSVC toolchain itself, no VS Developer Prompt needed. There is no test suite; `cargo check` is the fast loop.
 
-`cargo build` fails with `os error 5` while a SnapFrame instance is running. Close it first — and close it *cleanly* (title-bar ×, or `WM_CLOSE`), never `Stop-Process`, for the reason in Gotchas.
+`cargo build` fails with `os error 5` while a SnapFrame instance is running. Close it first — and close it *cleanly* (the toolbar's × button, or a `WM_CLOSE`), never `Stop-Process`, for the reason in Gotchas.
 
 ## What this is
 
@@ -22,13 +22,13 @@ A tray ("お盆") window that adopts other apps' top-level windows as children s
 
 ## Architecture
 
-Four modules, layered. `unsafe` is concentrated at the bottom; the middle layers are safe Rust.
+Five modules. `window_manager` and `chrome` hold the bulk of the `unsafe`; `layout` is pure safe Rust with no Win32 calls at all, which is what makes the tiling rules cheap to reason about and change.
 
 - [src/main.rs](src/main.rs) — Win32 entry point and `wndproc`. Decodes messages and calls into `App`; holds no state of its own.
-- [src/app.rs](src/app.rs) — `App`: what is on the tray, hit-testing, drag state machine, commands. Owned by the main window via `GWLP_USERDATA` (boxed in `WM_CREATE`, dropped in `WM_NCDESTROY`).
-- [src/layout.rs](src/layout.rs) — the tiling model and its pixel geometry. No Win32 calls beyond plain structs.
-- [src/chrome.rs](src/chrome.rs) — GDI painting of the toolbar, pane headers and splitters.
-- [src/window_manager.rs](src/window_manager.rs) — every `unsafe` call that touches a foreign window: enumeration, `SetParent`, style save/restore, focus.
+- [src/app.rs](src/app.rs) — `App`: what is on the tray, hit-testing, the drag state machine, commands, focus and the non-client behaviour of the custom frame. Owned by the main window via `GWLP_USERDATA` (boxed in `WM_CREATE`, dropped in `WM_NCDESTROY`).
+- [src/layout.rs](src/layout.rs) — the tiling model, its pixel geometry and the DPI-scaled `Metrics`. No Win32 calls beyond plain structs.
+- [src/chrome.rs](src/chrome.rs) — GDI painting: toolbar, window controls, pane headers, splitters. Also owns the colour palette and the cached GDI objects.
+- [src/window_manager.rs](src/window_manager.rs) — every `unsafe` call that touches a *foreign* window: enumeration, `SetParent`, style save/restore, focus, and the `ADOPTED` registry.
 
 ### The tiling model
 
@@ -85,7 +85,7 @@ None of this works without the `AttachThreadInput` in `embed` — `SetFocus` on 
 
 ## Gotchas
 
-- **`match` on raw `u32` message constants is a trap.** An unimported constant is a valid catch-all binding, not a compile error, so it silently swallows every arm below it. This already happened once: `WM_MOUSELEAVE` lives in `Win32::UI::Controls`, not `WindowsAndMessaging`, and its bare name in `wndproc` killed ten handlers with only a `unreachable pattern` warning. Check warnings on any new message arm.
+- **`match` on raw `u32` message constants is a trap.** An unimported constant is a valid catch-all binding, not a compile error, so it silently swallows every arm below it. This already happened once: `WM_MOUSELEAVE` lives in `Win32::UI::Controls`, not `WindowsAndMessaging`, and its bare name in `wndproc` swallowed every arm below it — the build still succeeded, with only `unreachable pattern` warnings to show for it. Read the warnings after touching `wndproc`.
 - Other modules that are not where you would guess: `AttachThreadInput` is in `Win32::System::Threading`; `ClientToScreen` is in `Graphics::Gdi`.
 - **Killing the tray kills the adopted apps.** Windows destroys child windows with their parent, so `Stop-Process` on SnapFrame closes whatever was on it. The `WM_DESTROY` path and the panic hook both release first; keep it that way, and never add an exit path that skips them.
 - **Toolbar commands fire on `WM_LBUTTONUP`, not down.** A `TrackPopupMenu` opened during `WM_LBUTTONDOWN` is dismissed by the `WM_LBUTTONUP` that immediately follows it. `App::pressed_button` exists solely for this.
@@ -96,11 +96,22 @@ None of this works without the `AttachThreadInput` in `embed` — `SetFocus` on 
 - DPI is per-monitor v2 **plus** `SetThreadDpiHostingBehavior(DPI_HOSTING_BEHAVIOR_MIXED)`. Without mixed hosting, adopting a window whose process has different DPI awareness misbehaves.
 - `windows` crate features are minimal and explicit in [Cargo.toml](Cargo.toml); a new Win32 API usually needs its feature added first.
 
+## Not implemented
+
+Absent by choice so far, not by oversight — don't assume any of it exists when reading the code:
+
+- No persistence. Every launch starts with an empty tray; there is no config file.
+- No keyboard shortcuts and no tray icon.
+- No way to adopt a window that appears *later* (no watching, no rules) — the user picks from the menu each time.
+- Panes can be swapped but not dragged to an arbitrary position; the two-level tiling has no way to express "move this into a new column here".
+
 ## Testing against the real desktop
 
-Driving the GUI from PowerShell works, with two quirks worth knowing before concluding something is broken:
+Driving the GUI from PowerShell works. These quirks are worth knowing before concluding something is broken — each one cost a round of false debugging:
 
 - `FindWindow`/`FindWindowEx` return 0 in this environment. Locate windows with `EnumWindows` instead.
 - The **first** synthetic click after a script starts is consumed by window activation. Send a harmless warm-up click before the one you are actually testing.
 - Drive clicks in **client** coordinates (`ClientToScreen` on the tray), not window coordinates. With the caption reclaimed, the client origin is flush with the window's top edge, so the two differ by the frame inset only on the sides.
 - Caption-button positions are right-aligned, so they move with the window width — recompute them after a maximize instead of reusing coordinates from before it.
+- The "add window" menu lists candidates in z-order, which changes the moment the tray is focused. A test that picks an entry by index has to enumerate *after* focusing, and is still worth a retry loop.
+- Sending `WM_CLOSE` to an adopted app can block: `SendMessage` waits, and the app may be showing a modal "save changes?" prompt. Use `PostMessage`, or kill the process when the point is to test the liveness poll.
