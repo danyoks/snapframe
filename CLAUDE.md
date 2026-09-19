@@ -83,6 +83,10 @@ Four handlers cover it, and removing any one leaves a dead path:
 
 None of this works without the `AttachThreadInput` in `embed` — `SetFocus` on a window owned by another thread is a silent no-op otherwise.
 
+Focus is also z-order. Every one of those paths funnels through `App::activate`, which raises the pane (`wm::raise_child`) as well as focusing it; keep new paths going through it rather than calling `wm::focus_child` directly. The tiling never overlaps, but an adopted app is free to move or size itself inside the tray and plenty do, and a child window gets no activation of its own to bring it forward — so without the raise the focused pane can sit underneath a neighbour that spilled over it.
+
+For the same reason `App::pane_at_point` asks `ChildWindowFromPointEx` which window is actually under the pointer before falling back to the cached geometry: once panes overlap, the pane that owns a point in the tiling is not necessarily the one the user clicked. The fallback is what resolves clicks on our own chrome, where there is no child window to find.
+
 ## Gotchas
 
 - **`match` on raw `u32` message constants is a trap.** An unimported constant is a valid catch-all binding, not a compile error, so it silently swallows every arm below it. This already happened once: `WM_MOUSELEAVE` lives in `Win32::UI::Controls`, not `WindowsAndMessaging`, and its bare name in `wndproc` swallowed every arm below it — the build still succeeded, with only `unreachable pattern` warnings to show for it. Read the warnings after touching `wndproc`.

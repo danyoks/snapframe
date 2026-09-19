@@ -278,3 +278,32 @@ pub fn focus_child(child: HWND) {
         }
     }
 }
+
+/// Raise an adopted window above its siblings.
+///
+/// The tiling itself never overlaps, but an adopted app is still free to move or size
+/// itself inside the tray — plenty of them do on startup, on a mode switch, or when a
+/// pane is smaller than the app thinks it can be. As soon as two panes overlap, the
+/// focused one has to be the one on top, exactly as it would be on the desktop; child
+/// windows get no activation of their own, so nothing does this for us.
+pub fn raise_child(child: HWND) {
+    if !is_valid(child) {
+        return;
+    }
+    unsafe {
+        // Already frontmost among its siblings — skip the call rather than send a
+        // foreign window a position change on every focus event.
+        if GetWindow(child, GW_HWNDFIRST) == Ok(child) {
+            return;
+        }
+        let _ = SetWindowPos(
+            child,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}

@@ -252,10 +252,19 @@ impl App {
             title,
             snap,
         });
-        self.active = Some(target);
         self.relayout();
         self.refresh_children();
-        wm::focus_child(target);
+        self.activate(target);
+    }
+
+    /// Make `hwnd` the active pane: frontmost among its siblings and holding the
+    /// keyboard. Every path that changes the focused pane goes through here, so the
+    /// two never drift apart — a pane that has the keyboard but sits underneath an
+    /// overlapping neighbour is indistinguishable from a broken tray.
+    fn activate(&mut self, hwnd: HWND) {
+        self.active = Some(hwnd);
+        wm::raise_child(hwnd);
+        wm::focus_child(hwnd);
     }
 
     /// `SetParent` is refused for store apps and for windows owned by a process at a
@@ -311,9 +320,10 @@ impl App {
         if self.active.is_some_and(wm::is_valid) {
             return;
         }
-        self.active = self.layout.panes().next().map(|p| p.hwnd);
-        if let Some(hwnd) = self.active {
-            wm::focus_child(hwnd);
+        self.active = None;
+        let first = self.layout.panes().next().map(|p| p.hwnd);
+        if let Some(hwnd) = first {
+            self.activate(hwnd);
         }
     }
 
@@ -594,13 +604,13 @@ impl App {
     }
 
     fn focus_pane(&mut self, col: usize, slot: usize) {
-        if let Some(pane) = self.layout.pane_at(col, slot) {
-            let changed = self.active != Some(pane.hwnd);
-            self.active = Some(pane.hwnd);
-            wm::focus_child(pane.hwnd);
-            if changed {
-                self.invalidate();
-            }
+        let Some(hwnd) = self.layout.pane_at(col, slot).map(|p| p.hwnd) else {
+            return;
+        };
+        let changed = self.active != Some(hwnd);
+        self.activate(hwnd);
+        if changed {
+            self.invalidate();
         }
     }
 
@@ -620,14 +630,34 @@ impl App {
         self.to_client(pt)
     }
 
-    /// Focus whichever pane the pointer is over. The point is resolved through the
-    /// cached geometry rather than the clicked HWND, so a click on a deeply nested
-    /// control inside an adopted app still resolves to its pane.
+    /// Which pane a client-area point belongs to.
+    ///
+    /// The adopted window actually under the point wins, because panes can overlap
+    /// once an app sizes itself past its slot — and a click there went to that window,
+    /// not to whoever owns the pixel in our tiling. `ChildWindowFromPointEx` reports
+    /// the immediate child, so a click on a deeply nested control still resolves to
+    /// its pane. Our own chrome (headers, splitters, background) has no child window
+    /// there, which is what the geometry fallback is for.
+    fn pane_at_point(&self, pt: POINT) -> Option<(usize, usize)> {
+        let child = unsafe { ChildWindowFromPointEx(self.hwnd, pt, CWP_SKIPINVISIBLE) };
+        if child != self.hwnd
+            && child != HWND::default()
+            && let Some(idx) = self.layout.find(child)
+        {
+            return Some(idx);
+        }
+        match self.geom.hit_test(pt) {
+            Hit::Header(c, s) | Hit::Close(c, s) | Hit::Client(c, s) => Some((c, s)),
+            _ => None,
+        }
+    }
+
+    /// Focus whichever pane the pointer is over.
     fn focus_pane_at_cursor(&mut self) {
         let Some(pt) = self.cursor_client() else {
             return;
         };
-        if let Hit::Header(c, s) | Hit::Close(c, s) | Hit::Client(c, s) = self.geom.hit_test(pt) {
+        if let Some((c, s)) = self.pane_at_point(pt) {
             self.focus_pane(c, s);
         }
     }
@@ -654,7 +684,7 @@ impl App {
         let Some(pt) = self.cursor_client() else {
             return;
         };
-        if let Hit::Header(c, s) | Hit::Close(c, s) | Hit::Client(c, s) = self.geom.hit_test(pt)
+        if let Some((c, s)) = self.pane_at_point(pt)
             && let Some(pane) = self.layout.pane_at(c, s)
         {
             self.active = Some(pane.hwnd);
@@ -666,11 +696,9 @@ impl App {
         if !active {
             return;
         }
-        if self.active.is_none() {
-            self.active = self.layout.panes().next().map(|p| p.hwnd);
-        }
-        if let Some(hwnd) = self.active {
-            wm::focus_child(hwnd);
+        let pane = self.active.or_else(|| self.layout.panes().next().map(|p| p.hwnd));
+        if let Some(hwnd) = pane {
+            self.activate(hwnd);
         }
     }
 
@@ -679,7 +707,7 @@ impl App {
     /// splitter, the empty background) would leave the keyboard pointing at nothing.
     pub fn on_set_focus(&mut self) {
         if let Some(hwnd) = self.active {
-            wm::focus_child(hwnd);
+            self.activate(hwnd);
         }
     }
 
