@@ -5,6 +5,7 @@ edition = "2024"
 description = "A tray window that holds other apps' windows so Windows Snap moves them as one"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/danyoks/snapframe"
 publish = false
 
 [dependencies]
