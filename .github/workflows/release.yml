@@ -1,0 +1,47 @@
+# Push a tag like v0.1.0 to build snapframe.exe and publish it as a GitHub Release.
+# The tag must match the version in Cargo.toml.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $version"
+          }
+
+      - run: rustup update stable --no-self-update
+
+      - run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          $name = "snapframe-${{ github.ref_name }}-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/release/snapframe.exe, README.md, LICENSE-MIT, LICENSE-APACHE $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+          "ASSET=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" "$env:ASSET.zip" "$env:ASSET.zip.sha256" `
+            --title "SnapFrame ${{ github.ref_name }}" --generate-notes

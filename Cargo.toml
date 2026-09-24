@@ -2,6 +2,10 @@
 name = "snapframe"
 version = "0.1.0"
 edition = "2024"
+description = "A tray window that holds other apps' windows so Windows Snap moves them as one"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+publish = false
 
 [dependencies]
 windows = { version = "0.62.2", features = [

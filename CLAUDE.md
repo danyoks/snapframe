@@ -14,6 +14,8 @@ cargo clippy --all-targets
 
 Windows-only (Win32, `x86_64-pc-windows-msvc`). A plain PowerShell works — rustc locates the MSVC toolchain itself, no VS Developer Prompt needed. There is no test suite; `cargo check` is the fast loop.
 
+Releases are cut by pushing a `vX.Y.Z` tag that matches `Cargo.toml`'s `version`; [.github/workflows/release.yml](.github/workflows/release.yml) builds the zip and creates the GitHub Release. CI runs `cargo clippy -- -D warnings`, so warnings fail the build.
+
 `cargo build` fails with `os error 5` while a SnapFrame instance is running. Close it first — and close it *cleanly* (the toolbar's × button, or a `WM_CLOSE`), never `Stop-Process`, for the reason in Gotchas.
 
 ## What this is

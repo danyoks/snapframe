@@ -4,6 +4,12 @@
 
 お盆をスナップすれば、載せたアプリが全部いっしょに動いてリサイズされます。
 
+## ダウンロード
+
+[Releases](../../releases/latest) から `snapframe-vX.Y.Z-x86_64-pc-windows-msvc.zip` を取って展開してください。インストーラーはなく、`snapframe.exe` 単体で動きます。
+
+署名していない exe なので、初回起動時に SmartScreen の警告が出ることがあります。「詳細情報」→「実行」で起動できます。
+
 ## 使い方
 
 1. `snapframe.exe` を起動する
@@ -71,3 +77,21 @@ Windows 10 は未検証です。仕組み自体は動くはずですが、角丸
 - 載せたアプリが自前で描いているタイトルバー相当の UI（Windows Terminal のタブ列など）はそのまま残ります。取り除けるのは OS が描く枠だけです。
 - レイアウトは保存されません。起動するたびに空のお盆から始まります。
 - タスクトレイ常駐やキーボードショートカットはありません。
+
+## リリース手順
+
+`Cargo.toml` の `version` を上げてコミットし、同じ番号のタグを push すると、GitHub Actions がリリースビルドを作って Release に zip を添付します。
+
+```bash
+git tag v0.1.0
+```
+
+```bash
+git push origin v0.1.0
+```
+
+タグと `Cargo.toml` のバージョンが食い違っているとワークフローは失敗します。
+
+## ライセンス
+
+[MIT](LICENSE-MIT) または [Apache-2.0](LICENSE-APACHE) のいずれかを選んで利用できます。
