@@ -513,3 +513,433 @@ fn mean(weights: impl Iterator<Item = f32>) -> f32 {
     let (sum, n) = weights.fold((0.0f32, 0usize), |(s, n), w| (s + w, n + 1));
     if n == 0 { 1.0 } else { sum / n as f32 }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    fn pt(x: i32, y: i32) -> POINT {
+        POINT { x, y }
+    }
+
+    /// The handles are never dereferenced here; they only need to be distinct.
+    fn hwnd(n: usize) -> HWND {
+        HWND(n as *mut _)
+    }
+
+    fn pane(n: usize, free: RECT) -> Pane {
+        Pane {
+            hwnd: hwnd(n),
+            title: format!("pane {n}"),
+            snap: Snapshot {
+                style: 0,
+                exstyle: 0,
+                rect: free,
+                was_maximized: false,
+            },
+            free,
+            z: 0,
+        }
+    }
+
+    fn layout_with(n: usize) -> Layout {
+        let mut l = Layout::default();
+        for i in 1..=n {
+            l.add(pane(i, rect(0, 0, 200, 150)));
+        }
+        l
+    }
+
+    fn shape(l: &Layout) -> Vec<usize> {
+        l.cols.iter().map(|c| c.slots.len()).collect()
+    }
+
+    fn m() -> Metrics {
+        Metrics::for_dpi(96)
+    }
+
+    // ---- Metrics ----
+
+    #[test]
+    fn metrics_at_96_dpi_are_the_dip_values() {
+        let m = Metrics::for_dpi(96);
+        assert_eq!(m.toolbar, 36);
+        assert_eq!(m.header, 24);
+        assert_eq!(m.split, 6);
+        assert_eq!(m.min_slot, MIN_SLOT_DIP);
+        assert_eq!(m.caption_w, 46);
+    }
+
+    #[test]
+    fn metrics_scale_with_dpi_and_round() {
+        let m = Metrics::for_dpi(144);
+        assert_eq!(m.toolbar, 54);
+        assert_eq!(m.header, 36);
+        assert_eq!(m.split, 9);
+        // 14 * 1.25 = 17.5 rounds up.
+        assert_eq!(Metrics::for_dpi(120).font_px, 18);
+    }
+
+    // ---- distribute ----
+
+    #[test]
+    fn distribute_empty() {
+        assert!(distribute(0, 100, &[], 6).is_empty());
+    }
+
+    #[test]
+    fn distribute_single_fills_everything() {
+        assert_eq!(distribute(10, 100, &[3.0], 6), vec![(10, 100)]);
+    }
+
+    #[test]
+    fn distribute_leaves_gaps_and_ends_on_far_edge() {
+        for total in 50..400 {
+            let weights = [1.0, 2.0, 3.0, 0.7];
+            let out = distribute(5, total, &weights, 6);
+            assert_eq!(out.len(), weights.len());
+            for w in out.windows(2) {
+                let (x0, w0) = w[0];
+                let (x1, _) = w[1];
+                assert_eq!(x0 + w0 + 6, x1, "gap broken at total={total}");
+            }
+            let (x, w) = *out.last().unwrap();
+            assert_eq!(x + w, 5 + total, "far edge missed at total={total}");
+        }
+    }
+
+    #[test]
+    fn distribute_follows_weights() {
+        let out = distribute(0, 306, &[1.0, 2.0], 6);
+        assert_eq!(out, vec![(0, 100), (106, 200)]);
+    }
+
+    #[test]
+    fn distribute_survives_zero_weights_and_tiny_totals() {
+        let out = distribute(0, 100, &[0.0, 0.0], 6);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|&(_, w)| w >= 0));
+
+        let out = distribute(0, 4, &[1.0, 1.0, 1.0], 6);
+        assert!(out.iter().all(|&(_, w)| w == 0));
+    }
+
+    // ---- add / remove / find ----
+
+    #[test]
+    fn add_keeps_the_grid_roughly_square() {
+        let mut l = Layout::default();
+        let expected: [&[usize]; 6] = [&[1], &[1, 1], &[2, 1], &[2, 2], &[2, 2, 1], &[2, 2, 2]];
+        for (i, want) in expected.iter().enumerate() {
+            l.add(pane(i + 1, rect(0, 0, 10, 10)));
+            assert_eq!(shape(&l), *want, "after adding pane {}", i + 1);
+        }
+        assert_eq!(l.pane_count(), 6);
+    }
+
+    #[test]
+    fn add_stamps_increasing_z() {
+        let l = layout_with(3);
+        let mut zs: Vec<u32> = l.panes().map(|p| p.z).collect();
+        zs.sort();
+        assert_eq!(zs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn add_uses_the_mean_weight_of_peers() {
+        let mut l = layout_with(2);
+        l.cols[0].weight = 3.0;
+        l.cols[1].weight = 1.0;
+        l.add(pane(3, rect(0, 0, 10, 10)));
+        // Third pane stacks onto column 0 with the mean of its slot weights (1.0).
+        assert_eq!(shape(&l), vec![2, 1]);
+        assert_eq!(l.cols[0].slots[1].weight, 1.0);
+
+        l.add(pane(4, rect(0, 0, 10, 10)));
+        l.add(pane(5, rect(0, 0, 10, 10)));
+        // Fifth pane opens a column weighted at the mean of the existing ones.
+        assert_eq!(shape(&l), vec![2, 2, 1]);
+        assert_eq!(l.cols[2].weight, 2.0);
+    }
+
+    #[test]
+    fn remove_collapses_empty_columns() {
+        let mut l = layout_with(3); // [2, 1]
+        let p = l.remove(1, 0).expect("pane exists");
+        assert_eq!(p.hwnd, hwnd(2));
+        assert_eq!(shape(&l), vec![2]);
+        assert!(!l.contains(hwnd(2)));
+    }
+
+    #[test]
+    fn remove_out_of_range_is_none() {
+        let mut l = layout_with(2);
+        assert!(l.remove(5, 0).is_none());
+        assert!(l.remove(0, 3).is_none());
+        assert_eq!(l.pane_count(), 2);
+    }
+
+    #[test]
+    fn find_and_pane_at_agree() {
+        let l = layout_with(4);
+        for p in l.panes() {
+            let (c, s) = l.find(p.hwnd).unwrap();
+            assert_eq!(l.pane_at(c, s).unwrap().hwnd, p.hwnd);
+        }
+        assert!(l.find(hwnd(99)).is_none());
+        assert!(l.pane_at(9, 9).is_none());
+    }
+
+    #[test]
+    fn empty_layout() {
+        let l = Layout::default();
+        assert!(l.is_empty());
+        assert_eq!(l.arrange, Arrange::Free);
+    }
+
+    // ---- swap / rebalance ----
+
+    #[test]
+    fn swap_within_a_column_keeps_weights() {
+        let mut l = layout_with(3); // col 0 holds panes 1 and 3
+        l.cols[0].slots[0].weight = 2.0;
+        l.swap((0, 0), (0, 1));
+        assert_eq!(l.pane_at(0, 0).unwrap().hwnd, hwnd(3));
+        assert_eq!(l.pane_at(0, 1).unwrap().hwnd, hwnd(1));
+        assert_eq!(l.cols[0].slots[0].weight, 2.0);
+    }
+
+    #[test]
+    fn swap_across_columns_in_either_order() {
+        let mut l = layout_with(3);
+        l.swap((1, 0), (0, 1));
+        assert_eq!(l.pane_at(1, 0).unwrap().hwnd, hwnd(3));
+        assert_eq!(l.pane_at(0, 1).unwrap().hwnd, hwnd(2));
+    }
+
+    #[test]
+    fn swap_out_of_range_is_a_no_op() {
+        let mut l = layout_with(3);
+        l.swap((0, 0), (0, 7));
+        l.swap((0, 0), (7, 0));
+        l.swap((0, 0), (1, 4));
+        l.swap((1, 0), (1, 0));
+        let order: Vec<HWND> = l.panes().map(|p| p.hwnd).collect();
+        assert_eq!(order, vec![hwnd(1), hwnd(3), hwnd(2)]);
+    }
+
+    #[test]
+    fn rebalance_resets_every_weight() {
+        let mut l = layout_with(3);
+        l.cols[0].weight = 5.0;
+        l.cols[0].slots[1].weight = 0.2;
+        l.rebalance();
+        assert!(l.cols.iter().all(|c| c.weight == 1.0));
+        assert!(l.cols.iter().flat_map(|c| &c.slots).all(|s| s.weight == 1.0));
+    }
+
+    // ---- free arrangement ----
+
+    #[test]
+    fn raise_brings_a_pane_to_the_front_once() {
+        let mut l = layout_with(3);
+        assert!(!l.raise(hwnd(3)), "newest pane is already on top");
+        assert!(l.raise(hwnd(1)));
+        assert!(!l.raise(hwnd(1)));
+        let top = l.panes().max_by_key(|p| p.z).unwrap();
+        assert_eq!(top.hwnd, hwnd(1));
+        assert!(!l.raise(hwnd(99)));
+    }
+
+    #[test]
+    fn move_free_stores_the_clamped_rect() {
+        let mut l = layout_with(1);
+        let area = rect(0, 36, 800, 600);
+        l.move_free(hwnd(1), 700, -50, area);
+        assert_eq!(l.pane_at(0, 0).unwrap().free, rect(600, 36, 800, 186));
+    }
+
+    #[test]
+    fn clamp_into_prefers_the_top_left_when_too_big() {
+        let area = rect(0, 0, 100, 100);
+        assert_eq!(clamp_into(rect(50, 50, 250, 250), area), rect(0, 0, 200, 200));
+        assert_eq!(clamp_into(rect(10, 10, 20, 20), area), rect(10, 10, 20, 20));
+        assert_eq!(clamp_into(rect(-30, 95, -10, 105), area), rect(0, 90, 20, 100));
+    }
+
+    #[test]
+    fn free_geometry_clamps_without_writing_back() {
+        let mut l = Layout::default();
+        l.add(pane(1, rect(500, 400, 700, 550)));
+        let g = l.geometry(rect(0, 0, 400, 300), &m());
+        assert_eq!(g.slots[0][0].full, rect(200, 150, 400, 300));
+        // Growing back restores the original position.
+        assert_eq!(l.pane_at(0, 0).unwrap().free, rect(500, 400, 700, 550));
+        let g = l.geometry(rect(0, 0, 1000, 1000), &m());
+        assert_eq!(g.slots[0][0].full, rect(500, 400, 700, 550));
+    }
+
+    #[test]
+    fn free_geometry_orders_back_to_front_and_hit_test_picks_the_front() {
+        let mut l = Layout::default();
+        l.add(pane(1, rect(0, 0, 300, 300)));
+        l.add(pane(2, rect(100, 100, 400, 400)));
+        let area = rect(0, 0, 1000, 1000);
+
+        let g = l.geometry(area, &m());
+        assert_eq!(g.order, vec![(0, 0), (1, 0)]);
+        assert!(g.vsplits.is_empty());
+        assert_eq!(g.hit_test(pt(200, 200)), Hit::Client(1, 0));
+
+        l.raise(hwnd(1));
+        let g = l.geometry(area, &m());
+        assert_eq!(g.order, vec![(1, 0), (0, 0)]);
+        assert_eq!(g.hit_test(pt(200, 200)), Hit::Client(0, 0));
+        assert_eq!(g.hit_test(pt(350, 350)), Hit::Client(1, 0));
+        assert_eq!(g.hit_test(pt(900, 900)), Hit::None);
+    }
+
+    // ---- tile arrangement ----
+
+    fn tiled(n: usize) -> Layout {
+        let mut l = layout_with(n);
+        l.arrange = Arrange::Tile;
+        l
+    }
+
+    #[test]
+    fn tile_geometry_of_an_empty_layout_is_empty() {
+        let l = Layout {
+            arrange: Arrange::Tile,
+            ..Default::default()
+        };
+        let g = l.geometry(rect(0, 0, 100, 100), &m());
+        assert!(g.slots.is_empty() && g.order.is_empty());
+    }
+
+    #[test]
+    fn tile_geometry_covers_the_area_exactly() {
+        let l = tiled(3); // [2, 1]
+        let area = rect(0, 36, 1006, 636);
+        let g = l.geometry(area, &m());
+
+        assert_eq!(g.vsplits, vec![rect(500, 36, 506, 636)]);
+        assert_eq!(g.slots[0][0].full, rect(0, 36, 500, 333));
+        assert_eq!(g.hsplits[0], vec![rect(0, 333, 500, 339)]);
+        assert_eq!(g.slots[0][1].full, rect(0, 339, 500, 636));
+        assert_eq!(g.slots[1][0].full, rect(506, 36, 1006, 636));
+        assert!(g.hsplits[1].is_empty());
+        assert_eq!(g.order, vec![(0, 0), (0, 1), (1, 0)]);
+    }
+
+    #[test]
+    fn slot_geom_splits_header_close_and_client() {
+        let m = m();
+        let s = slot_geom(rect(0, 0, 300, 200), &m);
+        assert_eq!(s.header, rect(0, 0, 300, m.header));
+        assert_eq!(s.client, rect(0, m.header, 300, 200));
+        assert_eq!(s.close.right, 300 - m.pad);
+        assert_eq!(s.close.right - s.close.left, m.close);
+        assert!(s.close.top >= s.header.top && s.close.bottom <= s.header.bottom);
+    }
+
+    #[test]
+    fn hit_test_in_tile_mode() {
+        let m = m();
+        let l = tiled(3);
+        let g = l.geometry(rect(0, 0, 1006, 600), &m);
+        let close = g.slots[1][0].close;
+
+        assert_eq!(g.hit_test(pt(502, 300)), Hit::VSplit(0));
+        assert_eq!(g.hit_test(pt(100, g.hsplits[0][0].top)), Hit::HSplit(0, 0));
+        assert_eq!(g.hit_test(pt(close.left, close.top)), Hit::Close(1, 0));
+        assert_eq!(g.hit_test(pt(10, 5)), Hit::Header(0, 0));
+        assert_eq!(g.hit_test(pt(10, 500)), Hit::Client(0, 1));
+        assert_eq!(g.hit_test(pt(2000, 5)), Hit::None);
+    }
+
+    #[test]
+    fn drag_vsplit_moves_the_splitter_to_the_pointer() {
+        let m = m();
+        let mut l = tiled(2);
+        let area = rect(0, 0, 1006, 600);
+        l.drag_vsplit(0, 300, area, &m);
+        let g = l.geometry(area, &m);
+        assert_eq!(g.vsplits[0].left, 300);
+        // Only the pair's share moved; the total weight is unchanged.
+        assert!((l.cols[0].weight + l.cols[1].weight - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn drag_vsplit_clamps_to_the_minimum_slot() {
+        let m = m();
+        let mut l = tiled(2);
+        let area = rect(0, 0, 1006, 600);
+
+        l.drag_vsplit(0, -500, area, &m);
+        let g = l.geometry(area, &m);
+        assert_eq!(g.slots[0][0].full.right, m.min_slot);
+
+        l.drag_vsplit(0, 5000, area, &m);
+        let g = l.geometry(area, &m);
+        let last = g.slots[1][0].full;
+        assert_eq!(last.right - last.left, m.min_slot);
+    }
+
+    #[test]
+    fn drag_vsplit_ignores_the_last_column() {
+        let m = m();
+        let mut l = tiled(2);
+        l.drag_vsplit(1, 300, rect(0, 0, 1006, 600), &m);
+        assert_eq!((l.cols[0].weight, l.cols[1].weight), (1.0, 1.0));
+    }
+
+    #[test]
+    fn drag_hsplit_moves_only_its_pair() {
+        let m = m();
+        let mut l = tiled(5); // [2, 2, 1]
+        let area = rect(0, 0, 900, 606);
+        l.drag_hsplit(1, 0, 200, area, &m);
+        let g = l.geometry(area, &m);
+        assert_eq!(g.hsplits[1][0].top, 200);
+        assert_eq!(g.hsplits[0][0].top, 300, "other columns are untouched");
+
+        // Out-of-range splitters are ignored rather than panicking.
+        l.drag_hsplit(2, 0, 100, area, &m);
+        l.drag_hsplit(9, 0, 100, area, &m);
+    }
+
+    // ---- rect helpers ----
+
+    #[test]
+    fn contains_is_half_open() {
+        let r = rect(0, 0, 10, 10);
+        assert!(contains(&r, pt(0, 0)));
+        assert!(contains(&r, pt(9, 9)));
+        assert!(!contains(&r, pt(10, 5)));
+        assert!(!contains(&r, pt(5, 10)));
+    }
+
+    #[test]
+    fn intersects_excludes_touching_edges() {
+        let a = rect(0, 0, 10, 10);
+        assert!(intersects(&a, &rect(5, 5, 15, 15)));
+        assert!(!intersects(&a, &rect(10, 0, 20, 10)));
+        assert!(!intersects(&a, &rect(0, 10, 10, 20)));
+    }
+
+    #[test]
+    fn mean_defaults_to_one() {
+        assert_eq!(mean(std::iter::empty()), 1.0);
+        assert_eq!(mean([1.0, 3.0].into_iter()), 2.0);
+    }
+}
