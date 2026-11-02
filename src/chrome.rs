@@ -57,6 +57,7 @@ pub fn quiet_frame(hwnd: HWND) {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Command {
     Add,
+    Arrange,
     Rebalance,
     ReleaseAll,
 }
@@ -304,44 +305,47 @@ unsafe fn draw_all(dc: HDC, client: RECT, ctx: &PaintCtx) {
             }
         }
 
-        for (ci, col) in ctx.geom.slots.iter().enumerate() {
-            for (si, g) in col.iter().enumerate() {
-                let at = (ci, si);
-                let brush = if ctx.active == Some(at) {
-                    t.header_active
-                } else if matches!(ctx.hot, Hit::Header(c, s) | Hit::Close(c, s) if (c, s) == at) {
-                    t.header_hot
-                } else {
-                    t.header
+        // Back to front: free panes overlap, and a header has to be painted over by
+        // the panes stacked above it.
+        for &(ci, si) in &ctx.geom.order {
+            let Some(g) = ctx.geom.slots.get(ci).and_then(|col| col.get(si)) else {
+                continue;
+            };
+            let at = (ci, si);
+            let brush = if ctx.active == Some(at) {
+                t.header_active
+            } else if matches!(ctx.hot, Hit::Header(c, s) | Hit::Close(c, s) if (c, s) == at) {
+                t.header_hot
+            } else {
+                t.header
+            };
+            FillRect(dc, &g.header, brush);
+
+            if let Some(pane) = ctx.layout.pane_at(ci, si) {
+                let label = RECT {
+                    left: g.header.left + m.pad,
+                    right: g.close.left - m.pad,
+                    ..g.header
                 };
-                FillRect(dc, &g.header, brush);
-
-                if let Some(pane) = ctx.layout.pane_at(ci, si) {
-                    let label = RECT {
-                        left: g.header.left + m.pad,
-                        right: g.close.left - m.pad,
-                        ..g.header
-                    };
-                    if label.right > label.left {
-                        draw_label(
-                            dc,
-                            label,
-                            &pane.title,
-                            CLR_TEXT,
-                            DT_LEFT | DT_END_ELLIPSIS,
-                        );
-                    }
+                if label.right > label.left {
+                    draw_label(
+                        dc,
+                        label,
+                        &pane.title,
+                        CLR_TEXT,
+                        DT_LEFT | DT_END_ELLIPSIS,
+                    );
                 }
+            }
 
-                let close_hot = ctx.hot == Hit::Close(ci, si);
-                if close_hot {
-                    FillRect(dc, &g.close, t.close_hot);
-                }
-                draw_cross(dc, g.close, m, t.close_pen);
+            let close_hot = ctx.hot == Hit::Close(ci, si);
+            if close_hot {
+                FillRect(dc, &g.close, t.close_hot);
+            }
+            draw_cross(dc, g.close, m, t.close_pen);
 
-                if ctx.drop_target == Some(at) {
-                    frame(dc, g.full, t.accent_pen);
-                }
+            if ctx.drop_target == Some(at) {
+                frame(dc, g.full, t.accent_pen);
             }
         }
     }

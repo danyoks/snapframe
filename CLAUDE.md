@@ -38,6 +38,14 @@ Deliberately two levels: the tray is a **row of columns**, each column a **stack
 
 Sizes are **weights, never pixels**. `Layout::geometry` recomputes rects from weights on every resize, so a Snap is a pure recomputation with no accumulated drift. `distribute()` derives each position from a running cumulative fraction rather than summing rounded sizes, which is why the last item always lands exactly on the far edge — don't "simplify" it into a sum of rounded widths.
 
+### Arrangements
+
+Tiling is one of two `layout::Arrange` modes, switched from the toolbar's 配置 menu. The default is **`Free`**: each pane keeps the pixel size its window had on the desktop and sits at `Pane::free` (header + window, tray client coordinates). A window that already overlapped the tray is adopted at its exact screen position; others are cascaded. The header drags the pane instead of swapping it, and there are no splitters.
+
+The column structure is still maintained in free mode — `Layout::add` places every pane in the grid regardless — so switching to `Tile` always has a grid, and `Pane::free` survives tiling, so switching back restores every position.
+
+Free panes overlap, so `Geom::order` lists slots back to front (by the `Pane::z` stamp, bumped in `App::activate` via `Layout::raise`). Painting walks it forwards, `Geom::hit_test` backwards. In tile mode it is plain index order. `free_geometry` clamps panes into the tray without writing the clamp back, so shrinking and re-growing the tray is lossless; `Layout::move_free` *does* store the clamped rect, so a drag past the edge cannot leave the pane off-screen.
+
 `App::geom` caches the computed rects. Everything (painting, hit-testing, child placement) reads that cache; `App::relayout()` is the single place that refills it and pushes children to their new rects.
 
 ### Adoption lifecycle
@@ -106,7 +114,7 @@ For the same reason `App::pane_at_point` asks `ChildWindowFromPointEx` which win
 
 Absent by choice so far, not by oversight — don't assume any of it exists when reading the code:
 
-- No persistence. Every launch starts with an empty tray; there is no config file.
+- No persistence. Every launch starts with an empty tray in the free arrangement; there is no config file.
 - No keyboard shortcuts and no tray icon.
 - No way to adopt a window that appears *later* (no watching, no rules) — the user picks from the menu each time.
 - Panes can be swapped but not dragged to an arbitrary position; the two-level tiling has no way to express "move this into a new column here".

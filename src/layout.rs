@@ -6,6 +6,9 @@
 //!
 //! Sizes are stored as weights, never pixels, so a Snap resize is a pure
 //! recomputation and never accumulates rounding drift.
+//!
+//! Tiling is one of two arrangements. The default, [`Arrange::Free`], leaves every
+//! pane at the size it had on the desktop and ignores the columns entirely.
 
 use crate::window_manager::Snapshot;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
@@ -44,11 +47,27 @@ impl Metrics {
     }
 }
 
+/// How the tray places its panes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Arrange {
+    /// Every pane keeps the size it had on the desktop and stays where it is put;
+    /// resizing the tray only moves panes enough to keep them inside it.
+    #[default]
+    Free,
+    /// Panes share the tray as a row of columns, resized along with it.
+    Tile,
+}
+
 /// One adopted window plus what we need to give it back.
 pub struct Pane {
     pub hwnd: HWND,
     pub title: String,
     pub snap: Snapshot,
+    /// Header plus window, in tray client coordinates, for [`Arrange::Free`]. Kept
+    /// while tiled too, so switching back puts every pane where it was.
+    pub free: RECT,
+    /// Stacking stamp for [`Arrange::Free`]; the highest is frontmost.
+    pub z: u32,
 }
 
 pub struct Slot {
@@ -61,9 +80,13 @@ pub struct Column {
     pub slots: Vec<Slot>,
 }
 
+/// The column structure is maintained in both arrangements — free placement simply
+/// ignores it — so switching to tiling always has a sensible grid to fall back on.
 #[derive(Default)]
 pub struct Layout {
     pub cols: Vec<Column>,
+    pub arrange: Arrange,
+    next_z: u32,
 }
 
 /// Where a point landed. Toolbar buttons are hit-tested by the caller, which owns
@@ -97,6 +120,9 @@ pub struct Geom {
     pub slots: Vec<Vec<SlotGeom>>,
     pub vsplits: Vec<RECT>,
     pub hsplits: Vec<Vec<RECT>>,
+    /// Every slot, back to front. Free panes overlap, so painting walks this
+    /// forwards and hit-testing walks it backwards.
+    pub order: Vec<(usize, usize)>,
 }
 
 impl Layout {
@@ -123,7 +149,11 @@ impl Layout {
     /// Place a new pane so the grid stays roughly square: open a new column while
     /// there are fewer columns than the shortest column is deep, otherwise stack
     /// onto the shortest column.
-    pub fn add(&mut self, pane: Pane) {
+    pub fn add(&mut self, mut pane: Pane) {
+        // Newcomers land on top, as a freshly opened window would.
+        self.next_z += 1;
+        pane.z = self.next_z;
+
         let shortest = self
             .cols
             .iter()
@@ -218,8 +248,68 @@ impl Layout {
         }
     }
 
+    /// Bring a pane to the front of the free stacking order. Returns false when it
+    /// was already there, so the caller can skip a repaint.
+    pub fn raise(&mut self, hwnd: HWND) -> bool {
+        let top = self.panes().map(|p| p.z).max().unwrap_or(0);
+        let Some((c, s)) = self.find(hwnd) else {
+            return false;
+        };
+        let pane = &mut self.cols[c].slots[s].pane;
+        if pane.z == top {
+            return false;
+        }
+        self.next_z += 1;
+        pane.z = self.next_z;
+        true
+    }
+
+    /// Move a free pane so its top-left corner sits at `(left, top)`, kept inside `area`.
+    pub fn move_free(&mut self, hwnd: HWND, left: i32, top: i32, area: RECT) {
+        let Some((c, s)) = self.find(hwnd) else {
+            return;
+        };
+        let pane = &mut self.cols[c].slots[s].pane;
+        let r = pane.free;
+        pane.free = clamp_into(
+            RECT {
+                left,
+                top,
+                right: left + (r.right - r.left),
+                bottom: top + (r.bottom - r.top),
+            },
+            area,
+        );
+    }
+
     /// Compute pixel rects for `area` (the client area below the toolbar).
     pub fn geometry(&self, area: RECT, m: &Metrics) -> Geom {
+        match self.arrange {
+            Arrange::Tile => self.tile_geometry(area, m),
+            Arrange::Free => self.free_geometry(area, m),
+        }
+    }
+
+    /// Free panes are clamped into `area` here rather than when the tray resizes, so
+    /// shrinking the tray and growing it back returns every pane to where it was.
+    fn free_geometry(&self, area: RECT, m: &Metrics) -> Geom {
+        let mut geom = Geom::default();
+        let mut order = Vec::new();
+        for (ci, col) in self.cols.iter().enumerate() {
+            let mut col_slots = Vec::with_capacity(col.slots.len());
+            for (si, slot) in col.slots.iter().enumerate() {
+                col_slots.push(slot_geom(clamp_into(slot.pane.free, area), m));
+                order.push((slot.pane.z, (ci, si)));
+            }
+            geom.slots.push(col_slots);
+            geom.hsplits.push(Vec::new());
+        }
+        order.sort_by_key(|(z, _)| *z);
+        geom.order = order.into_iter().map(|(_, at)| at).collect();
+        geom
+    }
+
+    fn tile_geometry(&self, area: RECT, m: &Metrics) -> Geom {
         let mut geom = Geom::default();
         if self.cols.is_empty() {
             return geom;
@@ -245,32 +335,16 @@ impl Layout {
             let mut col_slots = Vec::with_capacity(ys.len());
             let mut col_splits = Vec::new();
             for (si, (y, h)) in ys.iter().copied().enumerate() {
-                let full = RECT {
-                    left: x,
-                    top: y,
-                    right: x + w,
-                    bottom: y + h,
-                };
-                let header = RECT {
-                    bottom: (full.top + m.header).min(full.bottom),
-                    ..full
-                };
-                let close = RECT {
-                    left: (header.right - m.close - m.pad).max(header.left),
-                    top: header.top + (m.header - m.close) / 2,
-                    right: (header.right - m.pad).max(header.left),
-                    bottom: header.top + (m.header - m.close) / 2 + m.close,
-                };
-                let client = RECT {
-                    top: header.bottom,
-                    ..full
-                };
-                col_slots.push(SlotGeom {
-                    full,
-                    header,
-                    close,
-                    client,
-                });
+                col_slots.push(slot_geom(
+                    RECT {
+                        left: x,
+                        top: y,
+                        right: x + w,
+                        bottom: y + h,
+                    },
+                    m,
+                ));
+                geom.order.push((ci, si));
                 if si + 1 < ys.len() {
                     col_splits.push(RECT {
                         left: x,
@@ -341,17 +415,19 @@ impl Geom {
                 }
             }
         }
-        for (ci, col) in self.slots.iter().enumerate() {
-            for (si, g) in col.iter().enumerate() {
-                if contains(&g.close, pt) {
-                    return Hit::Close(ci, si);
-                }
-                if contains(&g.header, pt) {
-                    return Hit::Header(ci, si);
-                }
-                if contains(&g.full, pt) {
-                    return Hit::Client(ci, si);
-                }
+        // Front to back, so the pane on top wins where free panes overlap.
+        for &(ci, si) in self.order.iter().rev() {
+            let Some(g) = self.slots.get(ci).and_then(|col| col.get(si)) else {
+                continue;
+            };
+            if contains(&g.close, pt) {
+                return Hit::Close(ci, si);
+            }
+            if contains(&g.header, pt) {
+                return Hit::Header(ci, si);
+            }
+            if contains(&g.full, pt) {
+                return Hit::Client(ci, si);
             }
         }
         Hit::None
@@ -360,6 +436,49 @@ impl Geom {
 
 pub fn contains(r: &RECT, p: POINT) -> bool {
     p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+}
+
+pub fn intersects(a: &RECT, b: &RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// Header, close button and window area for a slot occupying `full`.
+fn slot_geom(full: RECT, m: &Metrics) -> SlotGeom {
+    let header = RECT {
+        bottom: (full.top + m.header).min(full.bottom),
+        ..full
+    };
+    let close = RECT {
+        left: (header.right - m.close - m.pad).max(header.left),
+        top: header.top + (m.header - m.close) / 2,
+        right: (header.right - m.pad).max(header.left),
+        bottom: header.top + (m.header - m.close) / 2 + m.close,
+    };
+    let client = RECT {
+        top: header.bottom,
+        ..full
+    };
+    SlotGeom {
+        full,
+        header,
+        close,
+        client,
+    }
+}
+
+/// Slide `r` (without resizing it) until it lies inside `area`. When it is bigger
+/// than `area`, the top-left corner wins, since that is where the header and its
+/// handle live.
+fn clamp_into(r: RECT, area: RECT) -> RECT {
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let left = r.left.min(area.right - w).max(area.left);
+    let top = r.top.min(area.bottom - h).max(area.top);
+    RECT {
+        left,
+        top,
+        right: left + w,
+        bottom: top + h,
+    }
 }
 
 /// Split `total` px across `weights`, leaving `gap` px between neighbours.
