@@ -5,7 +5,7 @@
 //! decode messages and call in here.
 
 use crate::chrome::{BackBuffer, Button, CaptionButton, CaptionSlot, Command, PaintCtx, Theme};
-use crate::layout::{Geom, Hit, Layout, Metrics, Pane};
+use crate::layout::{Arrange, Geom, Hit, Layout, Metrics, Pane};
 use crate::window_manager as wm;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -29,10 +29,32 @@ pub const TIMER_MS: u32 = 400;
 /// How far the pointer must travel on a header before a click becomes a reorder drag.
 const DRAG_SLOP: i32 = 4;
 
-const TOOLBAR_ITEMS: [(Command, &str); 3] = [
-    (Command::Add, "＋ ウィンドウを追加"),
-    (Command::Rebalance, "均等に整列"),
-    (Command::ReleaseAll, "すべて解放"),
+/// Toolbar contents for an arrangement. "均等に整列" resets tiling weights, so it is
+/// only offered while tiling — a button that does nothing reads as a bug.
+fn toolbar_items(arrange: Arrange) -> Vec<(Command, &'static str)> {
+    let mut items = vec![
+        (Command::Add, "＋ ウィンドウを追加"),
+        (Command::Arrange, arrange_label(arrange)),
+    ];
+    if arrange == Arrange::Tile {
+        items.push((Command::Rebalance, "均等に整列"));
+    }
+    items.push((Command::ReleaseAll, "すべて解放"));
+    items
+}
+
+fn arrange_label(arrange: Arrange) -> &'static str {
+    match arrange {
+        Arrange::Free => "配置: 元のサイズ ▾",
+        Arrange::Tile => "配置: タイル ▾",
+    }
+}
+
+/// Entries of the arrangement menu, in menu order. Ids start at 1 because 0 is what
+/// `TrackPopupMenu` returns when the menu is dismissed.
+const ARRANGE_CHOICES: [(Arrange, &str); 2] = [
+    (Arrange::Free, "元のサイズのまま"),
+    (Arrange::Tile, "タイル"),
 ];
 
 enum Drag {
@@ -44,6 +66,9 @@ enum Drag {
         armed: bool,
         target: Option<(usize, usize)>,
     },
+    /// Header drag of a free pane. Tracked by handle so a pane dying mid-drag cannot
+    /// redirect it to a neighbour; `grab` is the pointer's offset from the pane's corner.
+    Float { hwnd: HWND, grab: POINT },
 }
 
 pub struct App {
@@ -132,7 +157,7 @@ impl App {
     fn build_buttons(&mut self) {
         self.buttons.clear();
         let mut x = self.m.pad;
-        for (cmd, label) in TOOLBAR_ITEMS {
+        for (cmd, label) in toolbar_items(self.layout.arrange) {
             let w = self.theme.text_width(label) + self.m.pad * 4;
             self.buttons.push(Button {
                 rect: RECT {
@@ -247,10 +272,13 @@ impl App {
         if title.is_empty() {
             title = "(無題)".into();
         }
+        let free = self.initial_free_rect(&snap);
         self.layout.add(Pane {
             hwnd: target,
             title,
             snap,
+            free,
+            z: 0,
         });
         self.relayout();
         self.refresh_children();
@@ -265,6 +293,61 @@ impl App {
         self.active = Some(hwnd);
         wm::raise_child(hwnd);
         wm::focus_child(hwnd);
+        // Headers are ours to paint, so they follow the window to the front.
+        if self.layout.raise(hwnd) {
+            self.geom = self.layout.geometry(self.content(), &self.m);
+            self.invalidate();
+        }
+    }
+
+    /// Where a pane starts out in the free arrangement, at the window's own size.
+    ///
+    /// If the window already overlaps the tray it stays exactly where it is on screen,
+    /// header added above it, so adopting it looks like nothing moved. Otherwise it is
+    /// cascaded from the top-left corner. Either way the geometry pass slides it fully
+    /// inside the tray.
+    fn initial_free_rect(&self, snap: &wm::Snapshot) -> RECT {
+        let (w, h) = (
+            snap.rect.right - snap.rect.left,
+            snap.rect.bottom - snap.rect.top,
+        );
+        let content = self.content();
+        let mut origin = POINT {
+            x: snap.rect.left,
+            y: snap.rect.top,
+        };
+        let mapped = unsafe { ScreenToClient(self.hwnd, &mut origin).as_bool() };
+        let at = RECT {
+            left: origin.x,
+            top: origin.y - self.m.header,
+            right: origin.x + w,
+            bottom: origin.y + h,
+        };
+        if mapped && crate::layout::intersects(&at, &content) {
+            return at;
+        }
+        let step = self.m.header * (self.layout.pane_count() % 8) as i32;
+        let left = content.left + self.m.pad + step;
+        let top = content.top + self.m.pad + step;
+        RECT {
+            left,
+            top,
+            right: left + w,
+            bottom: top + self.m.header + h,
+        }
+    }
+
+    fn set_arrange(&mut self, arrange: Arrange) {
+        if self.layout.arrange == arrange {
+            return;
+        }
+        self.layout.arrange = arrange;
+        self.drag = None;
+        self.hot = Hit::None;
+        self.hot_button = None;
+        self.build_buttons();
+        self.relayout();
+        self.refresh_children();
     }
 
     /// `SetParent` is refused for store apps and for windows owned by a process at a
@@ -383,11 +466,62 @@ impl App {
     fn run_command(&mut self, cmd: Command) {
         match cmd {
             Command::Add => self.show_add_menu(),
+            Command::Arrange => self.show_arrange_menu(),
             Command::Rebalance => {
                 self.layout.rebalance();
                 self.relayout();
             }
             Command::ReleaseAll => self.release_all(),
+        }
+    }
+
+    /// Screen point just below a toolbar button, where its popup menu opens.
+    fn menu_anchor(&self, cmd: Command) -> POINT {
+        let mut pt = self
+            .buttons
+            .iter()
+            .find(|b| b.cmd == cmd)
+            .map(|b| POINT {
+                x: b.rect.left,
+                y: b.rect.bottom,
+            })
+            .unwrap_or_default();
+        unsafe {
+            let _ = ClientToScreen(self.hwnd, &mut pt);
+        }
+        pt
+    }
+
+    fn show_arrange_menu(&mut self) {
+        let pt = self.menu_anchor(Command::Arrange);
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else {
+                return;
+            };
+            for (i, (arrange, label)) in ARRANGE_CHOICES.iter().enumerate() {
+                let checked = if *arrange == self.layout.arrange {
+                    MF_CHECKED
+                } else {
+                    MF_UNCHECKED
+                };
+                let text = wm::to_utf16(label);
+                let _ = AppendMenuW(menu, MF_STRING | checked, i + 1, PCWSTR(text.as_ptr()));
+            }
+            let choice = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+                pt.x,
+                pt.y,
+                None,
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+
+            let idx = choice.0 as usize;
+            if let Some((arrange, _)) = idx.checked_sub(1).and_then(|i| ARRANGE_CHOICES.get(i)) {
+                self.set_arrange(*arrange);
+            }
         }
     }
 
@@ -397,15 +531,7 @@ impl App {
             .filter(|(h, _)| *h != self.hwnd && !self.layout.contains(*h))
             .collect();
 
-        let anchor = self
-            .buttons
-            .iter()
-            .find(|b| b.cmd == Command::Add)
-            .map(|b| POINT {
-                x: b.rect.left,
-                y: b.rect.bottom,
-            })
-            .unwrap_or_default();
+        let pt = self.menu_anchor(Command::Add);
 
         unsafe {
             let Ok(menu) = CreatePopupMenu() else {
@@ -421,8 +547,6 @@ impl App {
                 }
             }
 
-            let mut pt = anchor;
-            let _ = ClientToScreen(self.hwnd, &mut pt);
             let choice = TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
@@ -514,6 +638,13 @@ impl App {
                 self.invalidate();
                 return;
             }
+            Some(Drag::Float { hwnd, grab }) => {
+                self.layout
+                    .move_free(hwnd, pt.x - grab.x, pt.y - grab.y, self.content());
+                self.drag = Some(Drag::Float { hwnd, grab });
+                self.relayout();
+                return;
+            }
             None => {}
         }
 
@@ -555,12 +686,30 @@ impl App {
             }
             Hit::Header(c, s) => {
                 self.focus_pane(c, s);
-                self.drag = Some(Drag::Move {
-                    from: (c, s),
-                    origin: pt,
-                    armed: false,
-                    target: None,
-                });
+                // Free panes are moved by their header; tiled ones are swapped by it.
+                self.drag = match self.layout.arrange {
+                    Arrange::Free => {
+                        let (Some(pane), Some(g)) = (
+                            self.layout.pane_at(c, s),
+                            self.geom.slots.get(c).and_then(|col| col.get(s)),
+                        ) else {
+                            return;
+                        };
+                        Some(Drag::Float {
+                            hwnd: pane.hwnd,
+                            grab: POINT {
+                                x: pt.x - g.full.left,
+                                y: pt.y - g.full.top,
+                            },
+                        })
+                    }
+                    Arrange::Tile => Some(Drag::Move {
+                        from: (c, s),
+                        origin: pt,
+                        armed: false,
+                        target: None,
+                    }),
+                };
                 unsafe { SetCapture(self.hwnd) };
             }
             Hit::Client(c, s) => self.focus_pane(c, s),
@@ -595,7 +744,7 @@ impl App {
                 self.relayout();
                 self.refresh_children();
             }
-            Some(Drag::VSplit(_) | Drag::HSplit(..)) => {
+            Some(Drag::VSplit(_) | Drag::HSplit(..) | Drag::Float { .. }) => {
                 self.invalidate();
                 self.refresh_children();
             }
